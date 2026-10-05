@@ -1,0 +1,17 @@
+{
+  "name": "npc-irl-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.0.0",
+    "@fastify/multipart": "^9.2.1",
+    "dotenv": "^17.2.2",
+    "fastify": "^5.5.0",
+    "pg": "^8.16.3"
+  }
+}

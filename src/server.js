@@ -57,7 +57,7 @@ app.post("/api/users", async (req, reply) => {
   const body=req.body || {};
   const id=body.id || uid();
   const user=await ensureUser(id, body.display_name || "Player");
-  await ensureQuestsForUser(user);
+  // Never block user creation on AI quest generation.
   return { user };
 });
 

@@ -45,6 +45,8 @@ export async function initDb() {
       from_evidence UUID REFERENCES evidence(id) ON DELETE CASCADE, to_evidence UUID REFERENCES evidence(id) ON DELETE CASCADE,
       note TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id,case_id,from_evidence,to_evidence)
     );
+    CREATE TABLE IF NOT EXISTS clue_links (id UUID PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, case_id UUID REFERENCES cases(id) ON DELETE CASCADE, from_evidence UUID REFERENCES evidence(id) ON DELETE CASCADE, to_evidence UUID REFERENCES evidence(id) ON DELETE CASCADE, note TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id,case_id,from_evidence,to_evidence));
+    CREATE INDEX IF NOT EXISTS idx_clue_links_case ON clue_links(user_id,case_id);
     CREATE TABLE IF NOT EXISTS achievements (
       id UUID PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       code TEXT NOT NULL, unlocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, code)

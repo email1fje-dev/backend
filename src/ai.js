@@ -2,7 +2,11 @@ const MODEL = process.env.OPENROUTER_MODEL || "google/gemma-3-27b-it:free";
 
 async function callOpenRouter(messages, maxTokens=900) {
   if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
-  const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  let r;
+  try {
+    r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -15,11 +19,18 @@ async function callOpenRouter(messages, maxTokens=900) {
       messages,
       temperature: 0.9,
       max_tokens: maxTokens
-    })
-  });
-  if (!r.ok) throw new Error(`OpenRouter error ${r.status}: ${await r.text()}`);
-  const data = await r.json();
-  return data.choices?.[0]?.message?.content || "";
+    }),
+    signal: controller.signal
+    });
+    if (!r.ok) throw new Error(`OpenRouter error ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+    return data.choices?.[0]?.message?.content || "";
+  } catch (e) {
+    if (e?.name === "AbortError") throw new Error("OpenRouter request timed out");
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function extractJson(text) {

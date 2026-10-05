@@ -1,151 +1,53 @@
 import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import multipart from "@fastify/multipart";
+import { initDb,q } from "./db.js";
+import { detectiveReply } from "./ai.js";
 import crypto from "node:crypto";
-import { initDb, q } from "./db.js";
-import { generateQuests, verifyProof } from "./ai.js";
-
-const app = Fastify({ logger: true, bodyLimit: 8 * 1024 * 1024 });
-await app.register(cors, { origin: true });
-await app.register(multipart, {
-  limits: { fileSize: 6 * 1024 * 1024, files: 1 }
-});
-
-const uid = () => crypto.randomUUID();
-
-function levelFromXp(xp) {
-  return Math.floor(Math.sqrt(Math.max(0, xp) / 100)) + 1;
+const app=Fastify({logger:true,bodyLimit:8*1024*1024});
+await app.register(cors,{origin:true});
+const uid=()=>crypto.randomUUID();
+async function ensureUser(id,name="کارآگاه"){
+ const x=await q("SELECT * FROM users WHERE id=$1",[id]); if(x.rowCount)return x.rows[0];
+ await q("INSERT INTO users(id,display_name) VALUES($1,$2)",[id,String(name).slice(0,40)]);
+ return (await q("SELECT * FROM users WHERE id=$1",[id])).rows[0];
 }
-
-async function ensureUser(id, displayName="Player") {
-  const existing = await q("SELECT * FROM users WHERE id=$1", [id]);
-  if (existing.rowCount) return existing.rows[0];
-  await q("INSERT INTO users(id, display_name) VALUES($1,$2)", [id, displayName.slice(0,40)]);
-  return (await q("SELECT * FROM users WHERE id=$1", [id])).rows[0];
-}
-
-async function ensureQuestsForUser(user) {
-  const active = await q(
-    "SELECT COUNT(*)::int AS count FROM user_quests WHERE user_id=$1 AND status='active'",
-    [user.id]
-  );
-  if (active.rows[0].count >= 3) return;
-  const context = await q(`
-    SELECT q.category, q.title, q.description
-    FROM user_quests uq JOIN quests q ON q.id=uq.quest_id
-    WHERE uq.user_id=$1 ORDER BY uq.assigned_at DESC LIMIT 12
-  `, [user.id]);
-  const completed = await q("SELECT COUNT(*)::int AS count FROM user_quests WHERE user_id=$1 AND status='completed'", [user.id]);
-  const generated = await generateQuests({
-    level:user.level, completed:completed.rows[0].count,
-    recentCategories:context.rows.map(x=>x.category),
-    recentQuestTexts:context.rows.map(x=>x.title+" - "+x.description)
-  });
-  for (const x of generated) {
-    const id=uid();
-    await q(`INSERT INTO quests(id,title,description,category,difficulty,reward_xp,reward_coins,proof_type,ai_seed)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [id,x.title,x.description,x.category,x.difficulty,x.reward_xp,x.reward_coins,x.proof_type,"generated"]);
-    await q("INSERT INTO user_quests(user_id,quest_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[user.id,id]);
-  }
-}
-
-app.get("/health", async () => ({ ok:true, service:"npc-irl-backend", time:new Date().toISOString() }));
-
-app.post("/api/users", async (req, reply) => {
-  const body=req.body || {};
-  const id=body.id || uid();
-  const user=await ensureUser(id, body.display_name || "Player");
-  // Never block user creation on AI quest generation.
-  return { user };
+app.get("/health",async()=>({ok:true,service:"detective-backend",time:new Date().toISOString()}));
+app.post("/api/users",async req=>({user:await ensureUser((req.body||{}).id||uid(),(req.body||{}).display_name||"کارآگاه")}));
+app.get("/api/users/:id",async(req,rep)=>{const r=await q("SELECT * FROM users WHERE id=$1",[req.params.id]);if(!r.rowCount)return rep.code(404).send({error:"User not found"});return {user:r.rows[0]}});
+app.get("/api/cases",async(req)=>{const uidp=req.query?.user_id;const r=await q(`
+ SELECT c.*,coalesce(cp.status,'locked') as progress_status,coalesce(cp.score,0) as score
+ FROM cases c LEFT JOIN case_progress cp ON cp.case_id=c.id AND cp.user_id=$1
+ WHERE c.status='active' ORDER BY c.created_at DESC`,[uidp||"00000000-0000-0000-0000-000000000000"]);return {cases:r.rows}});
+app.get("/api/cases/:id",async req=>{
+ const id=req.params.id;
+ const c=await q("SELECT * FROM cases WHERE id=$1",[id]); if(!c.rowCount)return {error:"Case not found"};
+ const s=await q("SELECT * FROM suspects WHERE case_id=$1 ORDER BY name",[id]);
+ const e=await q("SELECT * FROM evidence WHERE case_id=$1 AND secret=false ORDER BY title",[id]);
+ const p=await q("SELECT * FROM case_progress WHERE case_id=$1",[id]);
+ return {case:c.rows[0],suspects:s.rows,evidence:e.rows,progress:p.rows[0]||null};
 });
-
-app.get("/api/users/:id", async (req, reply) => {
-  const r=await q("SELECT * FROM users WHERE id=$1",[req.params.id]);
-  if (!r.rowCount) return reply.code(404).send({error:"User not found"});
-  return {user:r.rows[0]};
+app.post("/api/cases/:id/start",async req=>{const u=await ensureUser(req.body?.user_id);await q("INSERT INTO case_progress(user_id,case_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[u.id,req.params.id]);return {ok:true}});
+app.get("/api/cases/:caseId/suspects/:suspectId/interviews",async req=>{const r=await q("SELECT question,answer,created_at FROM interviews WHERE user_id=$1 AND case_id=$2 AND suspect_id=$3 ORDER BY created_at",[req.query.user_id,req.params.caseId,req.params.suspectId]);return {interviews:r.rows}});
+app.post("/api/cases/:caseId/suspects/:suspectId/interview",async req=>{
+ const user=await ensureUser(req.body?.user_id);const question=String(req.body?.question||"").trim();if(!question)return {error:"سؤال خالی است"};
+ const s=await q("SELECT * FROM suspects WHERE id=$1 AND case_id=$2",[req.params.suspectId,req.params.caseId]);if(!s.rowCount)return {error:"مظنون پیدا نشد"};
+ const ev=await q("SELECT title,description FROM evidence WHERE case_id=$1 AND secret=false",[req.params.caseId]);
+ const history=await q("SELECT question,answer FROM interviews WHERE user_id=$1 AND suspect_id=$2 ORDER BY created_at DESC LIMIT 8",[user.id,s.rows[0].id]);
+ const answer=await detectiveReply({suspect:s.rows[0],question,evidence:ev.rows,history:history.rows});
+ await q("INSERT INTO interviews(id,user_id,case_id,suspect_id,question,answer) VALUES($1,$2,$3,$4,$5,$6)",[uid(),user.id,req.params.caseId,s.rows[0].id,question,answer]);
+ return {answer};
 });
-
-app.get("/api/users/:id/quests", async (req, reply) => {
-  const user=await ensureUser(req.params.id);
-  try { await ensureQuestsForUser(user); }
-  catch (e) { req.log.error(e); }
-  const r=await q(`
-    SELECT q.id,q.title,q.description,q.category,q.difficulty,q.reward_xp,q.reward_coins,q.proof_type,
-           uq.status,uq.assigned_at,uq.completed_at
-    FROM user_quests uq JOIN quests q ON q.id=uq.quest_id
-    WHERE uq.user_id=$1 AND uq.status='active'
-    ORDER BY uq.assigned_at DESC LIMIT 20
-  `,[user.id]);
-  return {quests:r.rows};
+app.post("/api/cases/:id/notes",async req=>{const u=await ensureUser(req.body?.user_id);const body=String(req.body?.body||"").trim();if(!body)return {error:"یادداشت خالی است"};await q("INSERT INTO detective_notes(id,user_id,case_id,body) VALUES($1,$2,$3,$4)",[uid(),u.id,req.params.id,body]);return {ok:true}});
+app.get("/api/cases/:id/notes",async req=>{const r=await q("SELECT id,body,created_at FROM detective_notes WHERE user_id=$1 AND case_id=$2 ORDER BY created_at DESC",[req.query.user_id,req.params.id]);return {notes:r.rows}});
+app.post("/api/cases/:id/accuse",async req=>{
+ const u=await ensureUser(req.body?.user_id);const suspect=String(req.body?.suspect_id||"");
+ const right=(await q("SELECT id FROM suspects WHERE case_id=$1 ORDER BY name",[req.params.id])).rows[2]?.id;
+ const correct=suspect===right;const score=correct?100:35;
+ await q("INSERT INTO case_progress(user_id,case_id,status,score,accusation,updated_at) VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT(user_id,case_id) DO UPDATE SET status=$3,score=$4,accusation=$5,updated_at=NOW()",[u.id,req.params.id,correct?"solved":"failed",score,suspect]);
+ if(correct){await q("UPDATE users SET xp=xp+250,coins=coins+100,level=floor(sqrt((xp+250)/100))+1 WHERE id=$1",[u.id]);await q("INSERT INTO achievements(id,user_id,code) VALUES($1,$2,'CASE_01_SOLVED') ON CONFLICT DO NOTHING",[uid(),u.id])}
+ return {correct,score,message:correct?"پرونده حل شد. استدلالت درست بود.":"اتهام ثبت شد، اما چند تناقض هنوز بی‌جواب مانده."};
 });
-
-app.post("/api/users/:userId/quests/:questId/proof", async (req, reply) => {
-  const {userId,questId}=req.params;
-  const user=await ensureUser(userId);
-  const qr=await q(`
-    SELECT q.*, uq.status FROM quests q JOIN user_quests uq ON uq.quest_id=q.id
-    WHERE q.id=$1 AND uq.user_id=$2
-  `,[questId,userId]);
-  if (!qr.rowCount) return reply.code(404).send({error:"Quest not found"});
-  const quest=qr.rows[0];
-  if (quest.status !== "active") return reply.code(409).send({error:"Quest is not active"});
-
-  let proofType=quest.proof_type, textContent="", imageBase64="", mimeType="";
-  if (req.isMultipart()) {
-    const parts=req.parts();
-    for await (const part of parts) {
-      if (part.type==="file") {
-        const buffer=await part.toBuffer();
-        imageBase64=buffer.toString("base64");
-        mimeType=part.mimetype;
-      } else if (part.fieldname==="text") textContent=String(part.value || "");
-      else if (part.fieldname==="proof_type") proofType=String(part.value || proofType);
-    }
-  } else {
-    const body=req.body || {};
-    textContent=String(body.text || "");
-    proofType=String(body.proof_type || proofType);
-  }
-
-  if (proofType !== quest.proof_type) return reply.code(400).send({error:`This quest requires ${quest.proof_type} proof`});
-  const result=await verifyProof({quest,proofType,textContent,mimeType,imageBase64});
-  await q(`INSERT INTO proofs(id,user_id,quest_id,proof_type,mime_type,text_content,ai_verdict,ai_score,ai_reason)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [uid(),userId,questId,proofType,mimeType||null,textContent||null,result.verdict,result.score,result.reason]);
-
-  if (result.verdict !== "accepted") return {accepted:false, proof:result};
-
-  const xpGain=quest.reward_xp, coinGain=quest.reward_coins;
-  const newXp=user.xp+xpGain, newLevel=levelFromXp(newXp);
-  const now=new Date();
-  let streak=user.streak;
-  if (!user.last_completed_at) streak=1;
-  else {
-    const last=new Date(user.last_completed_at);
-    const days=Math.floor((now-last)/86400000);
-    streak = days===0 ? Math.max(1,streak) : days===1 ? streak+1 : 1;
-  }
-  await q(`UPDATE users SET xp=$1,level=$2,coins=coins+$3,streak=$4,last_completed_at=$5 WHERE id=$6`,
-    [newXp,newLevel,coinGain,streak,now,userId]);
-  await q("UPDATE user_quests SET status='completed',completed_at=$1 WHERE user_id=$2 AND quest_id=$3",[now,userId,questId]);
-  await q("INSERT INTO achievements(id,user_id,code) VALUES($1,$2,'FIRST_QUEST') ON CONFLICT DO NOTHING",[uid(),userId]);
-
-  const updated=(await q("SELECT * FROM users WHERE id=$1",[userId])).rows[0];
-  return {accepted:true,proof:result,reward:{xp:xpGain,coins:coinGain},user:updated};
-});
-
-app.get("/api/users/:id/achievements", async (req) => {
-  const r=await q("SELECT code,unlocked_at FROM achievements WHERE user_id=$1 ORDER BY unlocked_at DESC",[req.params.id]);
-  return {achievements:r.rows};
-});
-
-app.setErrorHandler((error, req, reply) => {
-  req.log.error(error);
-  reply.code(error.statusCode || 500).send({error:error.message || "Internal server error"});
-});
-
-await initDb();
-const port=Number(process.env.PORT || 3000);
-await app.listen({port,host:"0.0.0.0"});
+app.get("/api/users/:id/achievements",async req=>{const r=await q("SELECT code,unlocked_at FROM achievements WHERE user_id=$1 ORDER BY unlocked_at DESC",[req.params.id]);return {achievements:r.rows}});
+app.setErrorHandler((e,req,rep)=>{req.log.error(e);rep.code(e.statusCode||500).send({error:e.message||"خطای سرور"})});
+await initDb();await app.listen({port:Number(process.env.PORT||3000),host:"0.0.0.0"});
